@@ -1,10 +1,13 @@
 services:
-  - type: worker
-    name: telegram-screenshot-bot
+  - type: web
+    name: telegram-screenshot-bot-webhook
     env: docker
     region: oregon
     plan: starter
     dockerfilePath: ./Dockerfile
+    dockerCommand: python bot_webhook.py
     envVars:
       - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: RENDER_EXTERNAL_URL
         sync: false

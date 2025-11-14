@@ -32,16 +32,25 @@ async def init_browser():
     try:
         playwright = await async_playwright().start()
         browser = await playwright.chromium.launch(
-            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+            headless=True,
+            args=[
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--disable-software-rasterizer',
+                '--disable-extensions'
+            ]
         )
         browser_context = await browser.new_context(
             viewport={'width': SCREENSHOT_WIDTH, 'height': SCREENSHOT_HEIGHT},
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         )
         logger.info("Browser initialized successfully")
+        return True
     except Exception as e:
         logger.error(f"Failed to initialize browser: {e}")
-        raise
+        return False
 
 async def close_browser():
     """Close browser on shutdown."""

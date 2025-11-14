@@ -1,24 +1,24 @@
-FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
+# Use official Playwright image with all dependencies pre-installed
+FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
 
+# Set working directory
 WORKDIR /app
 
-# Install requests for webhook clearing
-RUN pip install --no-cache-dir requests
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV PORT=10000
 
-# Copy requirements
+# Copy requirements first (for better caching)
 COPY requirements.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy all bot files
-COPY bot.py .
+# Copy application code
 COPY bot_webhook.py .
-COPY check_playwright.py .
-COPY clear_webhook.py .
 
-# Verify Playwright installation
-RUN python check_playwright.py
+# Expose port
+EXPOSE 10000
 
-# Default command (can be overridden in render.yaml)
-CMD ["sh", "-c", "python clear_webhook.py && python bot.py"]
+# Run the application
+CMD ["python", "bot_webhook.py"]

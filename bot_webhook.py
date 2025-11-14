@@ -23,13 +23,15 @@ PORT = int(os.getenv('PORT', 10000))
 # Screenshot settings
 SCREENSHOT_WIDTH = 1240
 SCREENSHOT_HEIGHT = 649
+SCREENSHOT_TIMEOUT = 60  # Increased from 30 to 60 seconds
+SCREENSHOT_MAX_RETRIES = 2
 
 # Global browser instance
 browser = None
 browser_context = None
 playwright_instance = None
 
-# Global application instance - INITIALIZE EARLY
+# Global application instance
 application = None
 
 async def init_browser():
@@ -56,14 +58,19 @@ async def init_browser():
                     '--disable-gpu',
                     '--disable-software-rasterizer',
                     '--disable-extensions',
-                    '--disable-blink-features=AutomationControlled'
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-web-security',
+                    '--disable-features=IsolateOrigins,site-per-process',
+                    '--no-first-run',
+                    '--no-zygote'
                 ]
             )
             logger.info("Browser launched successfully")
             
             browser_context = await browser.new_context(
                 viewport={'width': SCREENSHOT_WIDTH, 'height': SCREENSHOT_HEIGHT},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                ignore_https_errors=True
             )
             logger.info("Browser context created successfully")
             
@@ -133,38 +140,104 @@ def extract_urls(text):
     urls = re.findall(url_pattern, text)
     return urls
 
-async def capture_screenshot(url, timeout=30):
-    """Capture screenshot of URL using Playwright."""
+async def capture_screenshot(url, timeout=SCREENSHOT_TIMEOUT, max_retries=SCREENSHOT_MAX_RETRIES):
+    """Capture screenshot of URL using Playwright with advanced optimizations."""
     global browser_context
     
     if not browser_context:
         logger.error("Browser context is not initialized")
         return None
     
-    page = None
-    try:
-        page = await browser_context.new_page()
-        await page.goto(url, wait_until='domcontentloaded', timeout=timeout * 1000)
-        await page.wait_for_timeout(2000)
-        
-        screenshot_bytes = await page.screenshot(
-            full_page=False,
-            type='jpeg',
-            quality=85
-        )
-        
-        logger.info(f"Screenshot captured for: {url}")
-        return screenshot_bytes
-        
-    except Exception as e:
-        logger.error(f"Screenshot error for {url}: {e}")
-        return None
-    finally:
-        if page:
+    for attempt in range(max_retries):
+        page = None
+        try:
+            page = await browser_context.new_page()
+            
+            # Set extra HTTP headers
+            await page.set_extra_http_headers({
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+            })
+            
+            # Block heavy resources on first load to speed up
+            async def route_handler(route):
+                request = route.request
+                # Block fonts and some media on first pass
+                if request.resource_type in ["font", "media"]:
+                    await route.abort()
+                else:
+                    await route.continue_()
+            
+            await page.route("**/*", route_handler)
+            
+            # Try different wait strategies
+            page_loaded = False
+            strategies = ['commit', 'domcontentloaded', 'load']
+            
+            for strategy in strategies:
+                try:
+                    logger.info(f"Loading {url} with strategy '{strategy}' (attempt {attempt + 1}/{max_retries})...")
+                    await page.goto(
+                        url,
+                        wait_until=strategy,
+                        timeout=timeout * 1000
+                    )
+                    page_loaded = True
+                    logger.info(f"✅ Page loaded with strategy: {strategy}")
+                    break
+                except Exception as e:
+                    logger.warning(f"Strategy '{strategy}' failed: {str(e)[:100]}")
+                    if strategy == strategies[-1]:
+                        raise
+                    continue
+            
+            if not page_loaded:
+                raise Exception("All loading strategies failed")
+            
+            # Wait for page to settle
+            await page.wait_for_timeout(2000)
+            
+            # Unblock resources for screenshot
+            await page.unroute("**/*")
+            await page.wait_for_timeout(1500)
+            
+            # Scroll to load lazy images
             try:
-                await page.close()
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                await page.wait_for_timeout(1000)
+                await page.evaluate("window.scrollTo(0, 0)")
+                await page.wait_for_timeout(500)
             except:
-                pass
+                pass  # Ignore scroll errors
+            
+            # Take screenshot
+            screenshot_bytes = await page.screenshot(
+                full_page=False,
+                type='jpeg',
+                quality=85,
+                animations='disabled'
+            )
+            
+            logger.info(f"✅ Screenshot captured for: {url}")
+            return screenshot_bytes
+            
+        except Exception as e:
+            logger.error(f"Screenshot attempt {attempt + 1}/{max_retries} failed for {url}: {str(e)[:300]}")
+            
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in 2 seconds...")
+                await asyncio.sleep(2)
+            else:
+                logger.error(f"❌ All {max_retries} attempts failed for {url}")
+                return None
+        finally:
+            if page:
+                try:
+                    await page.close()
+                except:
+                    pass
+    
+    return None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send welcome message when /start is issued."""
@@ -194,7 +267,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. Send any message containing URLs\n"
         "2. Or forward a message with links to me\n"
         "3. I'll extract the links automatically\n"
-        "4. Wait for screenshots (usually 10-20 seconds)\n"
+        "4. Wait for screenshots (may take 30-60 seconds)\n"
         "5. Receive screenshots with your original message!\n\n"
         "*Supported:*\n"
         "• ANY website URL (http:// or https://)\n"
@@ -215,6 +288,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if browser and browser_context:
         status_text += "🌐 Screenshot engine: ✅ Ready\n"
+        status_text += f"⏱️ Timeout: {SCREENSHOT_TIMEOUT}s\n"
+        status_text += f"🔄 Max retries: {SCREENSHOT_MAX_RETRIES}\n"
         status_text += "📸 You can send URLs for screenshots!"
     elif browser and not browser_context:
         status_text += "🌐 Screenshot engine: ⚠️ Browser loaded but context failed\n"
@@ -254,8 +329,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Found {len(urls)} URL(s) from user {user_id}")
     
     confirm_msg = await update.message.reply_text(
-        f"✅ Found {len(urls)} link(s)!\n📸 Generating screenshot{'s' if len(urls) > 1 else ''}..."
+        f"✅ Found {len(urls)} link(s)!\n📸 Generating screenshot{'s' if len(urls) > 1 else ''}...\n\n"
+        f"⏱️ This may take 30-60 seconds for heavy websites..."
     )
+    
+    successful = 0
+    failed = 0
     
     for idx, url in enumerate(urls, 1):
         try:
@@ -267,18 +346,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if len(urls) > 1:
                 await confirm_msg.edit_text(
                     f"📸 Processing link {idx}/{len(urls)}...\n"
-                    f"🔗 {url[:50]}{'...' if len(url) > 50 else ''}"
+                    f"🔗 {url[:50]}{'...' if len(url) > 50 else ''}\n\n"
+                    f"⏱️ Please wait, loading page..."
                 )
             
             screenshot_bytes = await capture_screenshot(url)
             
             if not screenshot_bytes:
+                failed += 1
                 await update.message.reply_text(
-                    f"❌ Failed to capture screenshot for:\n{url}"
+                    f"❌ Failed to capture screenshot for:\n{url}\n\n"
+                    f"💡 The page might be too slow, blocking bots, or timing out.\n"
+                    f"Try shortening the URL or checking if it's accessible."
                 )
                 continue
             
-            caption = message_text[:1024]
+            # Caption handling
+            if len(urls) == 1:
+                caption = message_text[:1024]
+            else:
+                caption = f"📸 Screenshot {idx}/{len(urls)}\n🔗 {url[:900]}"
             
             await context.bot.send_chat_action(
                 chat_id=update.effective_chat.id, 
@@ -290,25 +377,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption=caption
             )
             
-            logger.info(f"Screenshot {idx} sent to user {user_id}")
+            successful += 1
+            logger.info(f"Screenshot {idx}/{len(urls)} sent to user {user_id}")
             
+            # Small delay between screenshots
             if idx < len(urls):
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
         
         except Exception as e:
+            failed += 1
             logger.error(f"Error processing URL {idx} from user {user_id}: {e}")
             await update.message.reply_text(
-                f"❌ Error processing link {idx}/{len(urls)}:\n{url}"
+                f"❌ Error processing link {idx}/{len(urls)}:\n{url}\n\n"
+                f"Error: {str(e)[:100]}"
             )
     
+    # Delete progress message
     try:
         await confirm_msg.delete()
     except:
         pass
     
-    await update.message.reply_text(
-        f"✅ Completed! Processed {len(urls)} link(s)."
-    )
+    # Send summary
+    summary = f"✅ Completed!\n\n"
+    summary += f"📊 Results:\n"
+    summary += f"  ✅ Successful: {successful}\n"
+    if failed > 0:
+        summary += f"  ❌ Failed: {failed}\n"
+    
+    await update.message.reply_text(summary)
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Log errors caused by updates."""
@@ -324,7 +421,7 @@ async def health_check(request):
     }
     
     if application and browser and browser_context:
-        return web.Response(text=f"OK - {status}", status=200)
+        return web.Response(text=f"OK - Bot: Active, Browser: Ready", status=200)
     else:
         return web.Response(text=f"Starting - {status}", status=200)
 
@@ -359,6 +456,8 @@ async def startup(app):
     print(f"📋 Bot Token: {BOT_TOKEN[:10]}...{BOT_TOKEN[-10:]}")
     print(f"🔌 Port: {PORT}")
     print(f"📐 Screenshot Size: {SCREENSHOT_WIDTH}x{SCREENSHOT_HEIGHT}")
+    print(f"⏱️ Timeout: {SCREENSHOT_TIMEOUT}s")
+    print(f"🔄 Max Retries: {SCREENSHOT_MAX_RETRIES}")
     print("=" * 60)
     
     # Initialize browser FIRST
@@ -437,7 +536,7 @@ def create_app():
     webhook_path = f"/webhook/{BOT_TOKEN}"
     app.router.add_post(webhook_path, webhook_handler)
     
-    # Startup and cleanup - FIXED: properly pass coroutines
+    # Startup and cleanup
     app.on_startup.append(startup)
     app.on_cleanup.append(shutdown)
     

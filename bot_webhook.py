@@ -29,6 +29,9 @@ browser = None
 browser_context = None
 playwright_instance = None
 
+# Global application instance - INITIALIZE EARLY
+application = None
+
 async def init_browser():
     """Initialize browser on startup."""
     global browser, browser_context, playwright_instance
@@ -313,10 +316,26 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def health_check(request):
     """Health check endpoint for Render."""
-    return web.Response(text="OK", status=200)
+    global browser, browser_context, application
+    
+    status = {
+        "bot": "initialized" if application else "not_initialized",
+        "browser": "ready" if (browser and browser_context) else "not_ready"
+    }
+    
+    if application and browser and browser_context:
+        return web.Response(text=f"OK - {status}", status=200)
+    else:
+        return web.Response(text=f"Starting - {status}", status=200)
 
 async def webhook_handler(request):
     """Handle incoming webhook updates."""
+    global application
+    
+    if not application:
+        logger.error("Application not initialized yet")
+        return web.Response(text="Service starting, please retry", status=503)
+    
     try:
         data = await request.json()
         update = Update.de_json(data, application.bot)
@@ -326,10 +345,7 @@ async def webhook_handler(request):
         logger.error(f"Webhook error: {e}")
         return web.Response(status=500)
 
-# Global application instance
-application = None
-
-async def startup():
+async def startup(app):
     """Initialize bot and browser on startup."""
     global application
     
@@ -345,11 +361,15 @@ async def startup():
     print(f"📐 Screenshot Size: {SCREENSHOT_WIDTH}x{SCREENSHOT_HEIGHT}")
     print("=" * 60)
     
-    # Initialize browser
-    logger.info("Initializing browser...")
-    await init_browser()
+    # Initialize browser FIRST
+    logger.info("Step 1: Initializing browser...")
+    browser_ready = await init_browser()
+    
+    if not browser_ready:
+        logger.error("Browser initialization failed, but continuing...")
     
     # Create application
+    logger.info("Step 2: Creating Telegram application...")
     application = Application.builder().token(BOT_TOKEN).build()
     
     # Add handlers
@@ -363,6 +383,7 @@ async def startup():
     application.add_error_handler(error_handler)
     
     # Initialize application
+    logger.info("Step 3: Initializing Telegram application...")
     await application.initialize()
     await application.start()
     
@@ -372,6 +393,7 @@ async def startup():
         webhook_path = f"/webhook/{BOT_TOKEN}"
         webhook_full_url = f"{webhook_url}{webhook_path}"
         
+        logger.info(f"Step 4: Setting webhook to {webhook_full_url}")
         await application.bot.set_webhook(
             url=webhook_full_url,
             allowed_updates=Update.ALL_TYPES,
@@ -386,11 +408,12 @@ async def startup():
     print("✅ Bot initialized successfully!")
     print("=" * 60)
 
-async def shutdown():
+async def shutdown(app):
     """Cleanup on shutdown."""
     global application
     
     logger.info("Shutting down...")
+    
     await close_browser()
     
     if application:
@@ -401,6 +424,9 @@ async def shutdown():
 
 def create_app():
     """Create and configure the web application."""
+    if not BOT_TOKEN:
+        raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set!")
+    
     app = web.Application()
     
     # Health check endpoint
@@ -411,12 +437,17 @@ def create_app():
     webhook_path = f"/webhook/{BOT_TOKEN}"
     app.router.add_post(webhook_path, webhook_handler)
     
-    # Startup and cleanup
-    app.on_startup.append(lambda app: startup())
-    app.on_cleanup.append(lambda app: shutdown())
+    # Startup and cleanup - FIXED: properly pass coroutines
+    app.on_startup.append(startup)
+    app.on_cleanup.append(shutdown)
     
     return app
 
 if __name__ == '__main__':
-    app = create_app()
-    web.run_app(app, host='0.0.0.0', port=PORT)
+    try:
+        app = create_app()
+        print(f"Starting web server on 0.0.0.0:{PORT}")
+        web.run_app(app, host='0.0.0.0', port=PORT)
+    except Exception as e:
+        logger.error(f"Failed to start application: {e}")
+        raise

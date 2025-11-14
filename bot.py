@@ -6,7 +6,7 @@ from io import BytesIO
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.constants import ChatAction
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Playwright
 
 # Configure logging
 logging.basicConfig(
@@ -22,16 +22,20 @@ BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 SCREENSHOT_WIDTH = 1240
 SCREENSHOT_HEIGHT = 649
 
-# Global browser instance
+# Global browser instances
+playwright_instance = None
 browser = None
 browser_context = None
 
 async def init_browser():
     """Initialize browser on startup."""
-    global browser, browser_context
+    global playwright_instance, browser, browser_context
     try:
-        playwright = await async_playwright().start()
-        browser = await playwright.chromium.launch(
+        logger.info("Starting Playwright...")
+        playwright_instance = await async_playwright().start()
+        
+        logger.info("Launching browser...")
+        browser = await playwright_instance.chromium.launch(
             headless=True,
             args=[
                 '--no-sandbox',
@@ -39,27 +43,43 @@ async def init_browser():
                 '--disable-dev-shm-usage',
                 '--disable-gpu',
                 '--disable-software-rasterizer',
-                '--disable-extensions'
+                '--disable-extensions',
+                '--no-first-run',
+                '--no-zygote',
+                '--single-process'
             ]
         )
+        
+        logger.info("Creating browser context...")
         browser_context = await browser.new_context(
             viewport={'width': SCREENSHOT_WIDTH, 'height': SCREENSHOT_HEIGHT},
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            java_script_enabled=True,
+            ignore_https_errors=True
         )
-        logger.info("Browser initialized successfully")
+        
+        logger.info("✅ Browser initialized successfully")
         return True
     except Exception as e:
-        logger.error(f"Failed to initialize browser: {e}")
+        logger.error(f"❌ Failed to initialize browser: {e}")
+        logger.exception("Full traceback:")
         return False
 
 async def close_browser():
     """Close browser on shutdown."""
-    global browser, browser_context
-    if browser_context:
-        await browser_context.close()
-    if browser:
-        await browser.close()
-    logger.info("Browser closed")
+    global playwright_instance, browser, browser_context
+    try:
+        if browser_context:
+            await browser_context.close()
+            logger.info("Browser context closed")
+        if browser:
+            await browser.close()
+            logger.info("Browser closed")
+        if playwright_instance:
+            await playwright_instance.stop()
+            logger.info("Playwright stopped")
+    except Exception as e:
+        logger.error(f"Error closing browser: {e}")
 
 def extract_urls(text):
     """Extract all URLs from text."""
@@ -70,33 +90,55 @@ def extract_urls(text):
 async def capture_screenshot(url, timeout=30):
     """Capture screenshot of URL using Playwright."""
     global browser_context
+    
+    if not browser_context:
+        logger.error("Browser context is not initialized")
+        return None
+    
     page = None
     try:
+        logger.info(f"Opening new page for: {url}")
         page = await browser_context.new_page()
+        
+        logger.info(f"Navigating to: {url}")
         await page.goto(url, wait_until='networkidle', timeout=timeout * 1000)
         
-        # Take screenshot
+        # Wait a bit for dynamic content
+        await page.wait_for_timeout(2000)
+        
+        logger.info(f"Taking screenshot for: {url}")
         screenshot_bytes = await page.screenshot(
             full_page=False,
             type='jpeg',
             quality=85
         )
         
-        logger.info(f"Screenshot captured for: {url}")
+        logger.info(f"✅ Screenshot captured successfully for: {url}")
         return screenshot_bytes
         
+    except asyncio.TimeoutError:
+        logger.error(f"⏱️ Timeout while loading: {url}")
+        return None
     except Exception as e:
-        logger.error(f"Screenshot error for {url}: {e}")
+        logger.error(f"❌ Screenshot error for {url}: {e}")
+        logger.exception("Full traceback:")
         return None
     finally:
         if page:
-            await page.close()
+            try:
+                await page.close()
+                logger.info(f"Page closed for: {url}")
+            except:
+                pass
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send welcome message when /start is issued."""
     logger.info(f"User {update.effective_user.id} started the bot")
+    
+    status = "✅ Active" if browser_context else "⚠️ Initializing"
+    
     await update.message.reply_text(
-        "✅ *Bot is Active!*\n\n"
+        f"*Bot Status: {status}*\n\n"
         "👋 Welcome! Send me any message containing URLs, "
         "and I'll send you screenshots!\n\n"
         "*Example messages:*\n"
@@ -107,7 +149,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Extract links from any message\n"
         "• Works with forwarded messages\n"
         "• Handles multiple links\n"
-        "• High-quality screenshots\n"
+        "• High-quality screenshots (1240x649)\n"
         "• Supports ALL websites!\n\n"
         "Just send or forward any message with links! 📸",
         parse_mode='Markdown'
@@ -135,15 +177,28 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Check bot status."""
-    status_text = "✅ Bot is active and working!\n"
-    if browser:
-        status_text += "🌐 Screenshot engine: Ready"
+    if browser and browser_context:
+        status_text = "✅ Bot is active and working!\n🌐 Screenshot engine: Ready"
     else:
-        status_text += "⚠️ Screenshot engine: Initializing..."
+        status_text = "⚠️ Bot is active but screenshot engine is initializing...\n🔄 Please wait a moment and try again."
+    
     await update.message.reply_text(status_text)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming messages and extract URLs."""
+    global browser, browser_context
+    
+    # Check if browser is available
+    if not browser or not browser_context:
+        logger.warning("Browser not available, attempting to initialize...")
+        await update.message.reply_text(
+            "⚠️ Screenshot service is initializing...\n"
+            "Please wait a moment and try again."
+        )
+        # Try to initialize again
+        await init_browser()
+        return
+    
     message_text = update.message.text or update.message.caption or ""
     user_id = update.effective_user.id
     
@@ -173,6 +228,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Found {len(urls)} links!\n📸 Generating screenshots..."
         )
     
+    successful_screenshots = 0
+    failed_screenshots = 0
+    
     # Process each URL
     for idx, url in enumerate(urls, 1):
         try:
@@ -185,16 +243,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if len(urls) > 1:
                 await confirm_msg.edit_text(
                     f"📸 Processing link {idx}/{len(urls)}...\n"
-                    f"🔗 {url[:50]}{'...' if len(url) > 50 else ''}"
+                    f"🔗 {url[:50]}{'...' if len(url) > 50 else ''}\n"
+                    f"⏱️ This may take 10-30 seconds..."
+                )
+            else:
+                await confirm_msg.edit_text(
+                    f"📸 Capturing screenshot...\n"
+                    f"🔗 {url[:50]}{'...' if len(url) > 50 else ''}\n"
+                    f"⏱️ This may take 10-30 seconds..."
                 )
             
             # Capture screenshot
-            screenshot_bytes = await capture_screenshot(url)
+            logger.info(f"Starting screenshot capture for URL {idx}/{len(urls)}: {url}")
+            screenshot_bytes = await capture_screenshot(url, timeout=45)
             
             if not screenshot_bytes:
+                logger.error(f"Screenshot capture returned None for: {url}")
                 await update.message.reply_text(
-                    f"❌ Failed to capture screenshot for:\n{url}"
+                    f"❌ Failed to capture screenshot for:\n{url}\n\n"
+                    "The site may be blocking automated access or taking too long to load."
                 )
+                failed_screenshots += 1
                 continue
             
             # Prepare caption
@@ -206,21 +275,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             
             # Send screenshot
+            logger.info(f"Sending screenshot {idx}/{len(urls)} to user {user_id}")
             await update.message.reply_photo(
                 photo=BytesIO(screenshot_bytes),
                 caption=caption
             )
             
-            logger.info(f"Screenshot {idx} sent to user {user_id}")
+            successful_screenshots += 1
+            logger.info(f"✅ Screenshot {idx} sent successfully to user {user_id}")
             
             # Delay between screenshots
             if idx < len(urls):
                 await asyncio.sleep(2)
         
         except Exception as e:
-            logger.error(f"Error processing URL {idx} from user {user_id}: {e}")
+            failed_screenshots += 1
+            logger.error(f"❌ Error processing URL {idx} from user {user_id}: {e}")
+            logger.exception("Full traceback:")
             await update.message.reply_text(
-                f"❌ Error processing link {idx}/{len(urls)}:\n{url}"
+                f"❌ Error processing link {idx}/{len(urls)}:\n{url}\n\n"
+                "An unexpected error occurred."
             )
     
     # Delete progress message
@@ -230,20 +304,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     
     # Send completion message
-    await update.message.reply_text(
-        f"✅ Completed! Processed {len(urls)} link(s)."
-    )
+    if successful_screenshots > 0:
+        await update.message.reply_text(
+            f"✅ Completed! Successfully processed {successful_screenshots}/{len(urls)} link(s)."
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ Failed to process any screenshots. Please try again later."
+        )
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Log errors caused by updates."""
     logger.error(f"Update {update} caused error {context.error}")
+    logger.exception("Full error traceback:")
 
 async def post_init(application):
     """Initialize browser after bot starts."""
-    await init_browser()
+    logger.info("Post-init: Starting browser initialization...")
+    success = await init_browser()
+    if success:
+        logger.info("✅ Post-init: Browser ready")
+    else:
+        logger.error("❌ Post-init: Browser initialization failed")
 
 async def post_shutdown(application):
     """Close browser on shutdown."""
+    logger.info("Post-shutdown: Closing browser...")
     await close_browser()
 
 def main():
@@ -254,6 +340,7 @@ def main():
         return
     
     print("🤖 Starting Telegram Screenshot Bot...")
+    print(f"📋 Bot Token: {BOT_TOKEN[:20]}...")
     
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()

@@ -2,18 +2,23 @@ FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
 
 WORKDIR /app
 
+# Install requests for webhook clearing
+RUN pip install --no-cache-dir requests
+
 # Copy requirements
 COPY requirements.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy bot code and test script
+# Copy all bot files
 COPY bot.py .
-COPY test_browser.py .
+COPY bot_webhook.py .
+COPY check_playwright.py .
+COPY clear_webhook.py .
 
-# Test browser installation (optional, comment out if causing issues)
-RUN python test_browser.py || echo "Browser test failed but continuing..."
+# Verify Playwright installation
+RUN python check_playwright.py
 
-# Run the bot
-CMD ["python", "-u", "bot.py"]
+# Default command (can be overridden in render.yaml)
+CMD ["sh", "-c", "python clear_webhook.py && python bot.py"]

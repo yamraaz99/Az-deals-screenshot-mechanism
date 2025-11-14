@@ -18,7 +18,6 @@ logger = logging.getLogger(__name__)
 
 # Get configuration from environment
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-WEBHOOK_URL = os.getenv('RENDER_EXTERNAL_URL', 'https://your-app.onrender.com')
 PORT = int(os.getenv('PORT', 10000))
 
 # Screenshot settings
@@ -316,22 +315,38 @@ async def health_check(request):
     """Health check endpoint for Render."""
     return web.Response(text="OK", status=200)
 
-async def main():
-    """Start the bot with webhook."""
+async def webhook_handler(request):
+    """Handle incoming webhook updates."""
+    try:
+        data = await request.json()
+        update = Update.de_json(data, application.bot)
+        await application.process_update(update)
+        return web.Response(status=200)
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return web.Response(status=500)
+
+# Global application instance
+application = None
+
+async def startup():
+    """Initialize bot and browser on startup."""
+    global application
+    
     if not BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN not set!")
-        return
+        raise ValueError("TELEGRAM_BOT_TOKEN not set")
     
     print("=" * 60)
     print("🤖 Telegram Screenshot Bot (Webhook Mode)")
     print("=" * 60)
     print(f"📋 Bot Token: {BOT_TOKEN[:10]}...{BOT_TOKEN[-10:]}")
-    print(f"🌐 Webhook URL: {WEBHOOK_URL}")
     print(f"🔌 Port: {PORT}")
     print(f"📐 Screenshot Size: {SCREENSHOT_WIDTH}x{SCREENSHOT_HEIGHT}")
     print("=" * 60)
     
     # Initialize browser
+    logger.info("Initializing browser...")
     await init_browser()
     
     # Create application
@@ -351,42 +366,57 @@ async def main():
     await application.initialize()
     await application.start()
     
-    # Set webhook
-    webhook_path = f"/webhook/{BOT_TOKEN}"
-    webhook_full_url = f"{WEBHOOK_URL}{webhook_path}"
+    # Set webhook - Render provides RENDER_EXTERNAL_URL automatically
+    webhook_url = os.getenv('RENDER_EXTERNAL_URL')
+    if webhook_url:
+        webhook_path = f"/webhook/{BOT_TOKEN}"
+        webhook_full_url = f"{webhook_url}{webhook_path}"
+        
+        await application.bot.set_webhook(
+            url=webhook_full_url,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
+        )
+        
+        print(f"✅ Webhook set: {webhook_full_url}")
+        logger.info(f"Webhook configured at {webhook_full_url}")
+    else:
+        logger.warning("RENDER_EXTERNAL_URL not set, webhook may not work correctly")
     
-    await application.bot.set_webhook(
-        url=webhook_full_url,
-        allowed_updates=Update.ALL_TYPES
-    )
-    
-    print(f"✅ Webhook set: {webhook_full_url}")
-    logger.info(f"Webhook configured at {webhook_full_url}")
-    
-    # Create web server
-    app = web.Application()
-    app.router.add_get('/health', health_check)
-    app.router.add_post(webhook_path, lambda req: application.update_queue.put(
-        Update.de_json(await req.json(), application.bot)
-    ) or web.Response(status=200))
-    
-    # Start web server
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    
-    print(f"✅ Web server started on port {PORT}")
+    print("✅ Bot initialized successfully!")
     print("=" * 60)
-    logger.info("Bot is running with webhook")
+
+async def shutdown():
+    """Cleanup on shutdown."""
+    global application
     
-    # Keep running
-    try:
-        await asyncio.Event().wait()
-    finally:
-        await close_browser()
+    logger.info("Shutting down...")
+    await close_browser()
+    
+    if application:
         await application.stop()
         await application.shutdown()
+    
+    logger.info("Shutdown complete")
+
+def create_app():
+    """Create and configure the web application."""
+    app = web.Application()
+    
+    # Health check endpoint
+    app.router.add_get('/health', health_check)
+    app.router.add_get('/', health_check)
+    
+    # Webhook endpoint
+    webhook_path = f"/webhook/{BOT_TOKEN}"
+    app.router.add_post(webhook_path, webhook_handler)
+    
+    # Startup and cleanup
+    app.on_startup.append(lambda app: startup())
+    app.on_cleanup.append(lambda app: shutdown())
+    
+    return app
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    app = create_app()
+    web.run_app(app, host='0.0.0.0', port=PORT)

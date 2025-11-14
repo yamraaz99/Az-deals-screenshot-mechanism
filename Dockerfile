@@ -8,8 +8,12 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy bot code
+# Copy bot code and test script
 COPY bot.py .
+COPY test_browser.py .
+
+# Test browser installation (optional, comment out if causing issues)
+RUN python test_browser.py || echo "Browser test failed but continuing..."
 
 # Run the bot
-CMD ["python", "bot.py"]
+CMD ["python", "-u", "bot.py"]

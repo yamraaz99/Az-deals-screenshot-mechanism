@@ -1,13 +1,10 @@
 services:
-  - type: web
+  - type: worker
     name: telegram-screenshot-bot
-    env: python
+    env: docker
     region: oregon
     plan: starter
-    buildCommand: chmod +x build.sh && ./build.sh
-    startCommand: python bot.py
+    dockerfilePath: ./Dockerfile
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
-      - key: PLAYWRIGHT_BROWSERS_PATH
-        value: /opt/render/project/.cache/ms-playwright

@@ -148,7 +148,7 @@ def get_url_type(url):
     if any(domain in url_lower for domain in ['fkrt.cc', 'fkrt.to', 'fkrt.site', 'fkrt.co']):
         return 'flipkart'
     # Amazon links
-    elif 'amzn.to' in url_lower or 'amazon.in' in url_lower():
+    elif 'amzn.to' in url_lower or 'amazon.in' in url_lower:  # FIXED: removed () after url_lower
         return 'amazon'
     else:
         return 'default'
@@ -399,17 +399,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     for idx, url in enumerate(urls, 1):
         try:
+            logger.info(f"Processing URL {idx}/{len(urls)}: {url}")
+            
             await context.bot.send_chat_action(
                 chat_id=update.effective_chat.id, 
                 action=ChatAction.TYPING
             )
             
             if len(urls) > 1:
-                await confirm_msg.edit_text(
-                    f"📸 Processing link {idx}/{len(urls)}...\n"
-                    f"🔗 {url[:50]}{'...' if len(url) > 50 else ''}\n\n"
-                    f"⏱️ Please wait, loading page..."
-                )
+                try:
+                    await confirm_msg.edit_text(
+                        f"📸 Processing link {idx}/{len(urls)}...\n"
+                        f"🔗 {url[:50]}{'...' if len(url) > 50 else ''}\n\n"
+                        f"⏱️ Please wait, loading page..."
+                    )
+                except Exception as edit_error:
+                    logger.warning(f"Failed to edit progress message: {edit_error}")
             
             screenshot_bytes = await capture_screenshot(url)
             
@@ -420,6 +425,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"💡 The page might be too slow, blocking bots, or timing out.\n"
                     f"Try shortening the URL or checking if it's accessible."
                 )
+                logger.warning(f"Screenshot failed for URL {idx}/{len(urls)}")
                 continue
             
             # Caption handling
@@ -439,7 +445,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             
             successful += 1
-            logger.info(f"Screenshot {idx}/{len(urls)} sent to user {user_id}")
+            logger.info(f"✅ Screenshot {idx}/{len(urls)} sent successfully")
             
             # Small delay between screenshots
             if idx < len(urls):
@@ -447,17 +453,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         except Exception as e:
             failed += 1
-            logger.error(f"Error processing URL {idx} from user {user_id}: {e}")
-            await update.message.reply_text(
-                f"❌ Error processing link {idx}/{len(urls)}:\n{url}\n\n"
-                f"Error: {str(e)[:100]}"
-            )
+            logger.error(f"Error processing URL {idx}/{len(urls)} from user {user_id}: {e}", exc_info=True)
+            try:
+                await update.message.reply_text(
+                    f"❌ Error processing link {idx}/{len(urls)}:\n{url}\n\n"
+                    f"Error: {str(e)[:100]}"
+                )
+            except Exception as reply_error:
+                logger.error(f"Failed to send error message: {reply_error}")
     
     # Delete progress message
     try:
         await confirm_msg.delete()
-    except:
-        pass
+    except Exception as delete_error:
+        logger.warning(f"Failed to delete progress message: {delete_error}")
     
     # Send summary
     summary = f"✅ Completed!\n\n"
@@ -466,11 +475,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if failed > 0:
         summary += f"  ❌ Failed: {failed}\n"
     
-    await update.message.reply_text(summary)
+    try:
+        await update.message.reply_text(summary)
+    except Exception as summary_error:
+        logger.error(f"Failed to send summary: {summary_error}")
+    
+    logger.info(f"Finished processing {len(urls)} URLs for user {user_id}. Success: {successful}, Failed: {failed}")
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Log errors caused by updates."""
-    logger.error(f"Update {update} caused error {context.error}")
+    logger.error(f"Update {update} caused error {context.error}", exc_info=context.error)
 
 async def health_check(request):
     """Health check endpoint for Render."""
@@ -500,7 +514,7 @@ async def webhook_handler(request):
         await application.process_update(update)
         return web.Response(status=200)
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
+        logger.error(f"Webhook error: {e}", exc_info=True)
         return web.Response(status=500)
 
 async def startup(app):

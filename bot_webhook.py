@@ -23,7 +23,7 @@ PORT = int(os.getenv('PORT', 10000))
 # Screenshot settings
 SCREENSHOT_WIDTH = 1240
 SCREENSHOT_HEIGHT = 649
-SCREENSHOT_TIMEOUT = 60  # Increased from 30 to 60 seconds
+SCREENSHOT_TIMEOUT = 60
 SCREENSHOT_MAX_RETRIES = 2
 
 # Global browser instance
@@ -140,6 +140,17 @@ def extract_urls(text):
     urls = re.findall(url_pattern, text)
     return urls
 
+def get_url_type(url):
+    """Determine the type of URL for screenshot customization."""
+    # Flipkart short links
+    if any(domain in url.lower() for domain in ['fkrt.cc', 'fkrt.to', 'fkrt.site']):
+        return 'flipkart'
+    # Amazon links
+    elif 'amzn.to' in url.lower() or 'amazon.in' in url.lower():
+        return 'amazon'
+    else:
+        return 'default'
+
 async def capture_screenshot(url, timeout=SCREENSHOT_TIMEOUT, max_retries=SCREENSHOT_MAX_RETRIES):
     """Capture screenshot of URL using Playwright with advanced optimizations."""
     global browser_context
@@ -147,6 +158,10 @@ async def capture_screenshot(url, timeout=SCREENSHOT_TIMEOUT, max_retries=SCREEN
     if not browser_context:
         logger.error("Browser context is not initialized")
         return None
+    
+    # Determine URL type for screenshot customization
+    url_type = get_url_type(url)
+    logger.info(f"URL type detected: {url_type} for {url}")
     
     for attempt in range(max_retries):
         page = None
@@ -201,22 +216,53 @@ async def capture_screenshot(url, timeout=SCREENSHOT_TIMEOUT, max_retries=SCREEN
             await page.unroute("**/*")
             await page.wait_for_timeout(1500)
             
-            # Scroll to load lazy images
-            try:
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-                await page.wait_for_timeout(1000)
-                await page.evaluate("window.scrollTo(0, 0)")
-                await page.wait_for_timeout(500)
-            except:
-                pass  # Ignore scroll errors
+            # Scroll to load lazy images (for default behavior)
+            if url_type == 'default':
+                try:
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                    await page.wait_for_timeout(1000)
+                    await page.evaluate("window.scrollTo(0, 0)")
+                    await page.wait_for_timeout(500)
+                except:
+                    pass  # Ignore scroll errors
             
-            # Take screenshot
-            screenshot_bytes = await page.screenshot(
-                full_page=False,
-                type='jpeg',
-                quality=85,
-                animations='disabled'
-            )
+            # Apply URL-specific screenshot logic
+            if url_type == 'flipkart':
+                # For Flipkart: Remove top 100px, final size 1240×540
+                logger.info("📸 Flipkart mode: Cropping top 100px (1240×540)")
+                screenshot_bytes = await page.screenshot(
+                    full_page=False,
+                    type='jpeg',
+                    quality=85,
+                    animations='disabled',
+                    clip={'x': 0, 'y': 100, 'width': SCREENSHOT_WIDTH, 'height': 540}
+                )
+            
+            elif url_type == 'amazon':
+                # For Amazon: Scroll down 250px to remove header, keep size 1240×649
+                logger.info("📸 Amazon mode: Scrolling down 250px, keeping 1240×649")
+                try:
+                    await page.evaluate("window.scrollTo(0, 250)")
+                    await page.wait_for_timeout(800)
+                except:
+                    pass
+                
+                screenshot_bytes = await page.screenshot(
+                    full_page=False,
+                    type='jpeg',
+                    quality=85,
+                    animations='disabled'
+                )
+            
+            else:
+                # Default behavior: 1240×649
+                logger.info("📸 Default mode: Standard 1240×649")
+                screenshot_bytes = await page.screenshot(
+                    full_page=False,
+                    type='jpeg',
+                    quality=85,
+                    animations='disabled'
+                )
             
             logger.info(f"✅ Screenshot captured for: {url}")
             return screenshot_bytes
@@ -255,7 +301,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Works with forwarded messages\n"
         "• Handles multiple links\n"
         "• High-quality screenshots\n"
-        "• Supports ALL websites!\n\n"
+        "• Supports ALL websites!\n"
+        "• Smart cropping for Amazon & Flipkart links\n\n"
         "Just send or forward any message with links! 📸",
         parse_mode='Markdown'
     )
@@ -273,6 +320,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• ANY website URL (http:// or https://)\n"
         "• Shopping sites, social media, news, blogs\n"
         "• Multiple links in one message\n\n"
+        "*Smart Cropping:*\n"
+        "• 🛍️ Flipkart links (fkrt.*): 1240×540 (top cropped)\n"
+        "• 📦 Amazon links: 1240×649 (header removed)\n"
+        "• 🌐 Other sites: 1240×649 (standard)\n\n"
         "*Commands:*\n"
         "/start - Start the bot\n"
         "/help - Show this message\n"
@@ -290,6 +341,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_text += "🌐 Screenshot engine: ✅ Ready\n"
         status_text += f"⏱️ Timeout: {SCREENSHOT_TIMEOUT}s\n"
         status_text += f"🔄 Max retries: {SCREENSHOT_MAX_RETRIES}\n"
+        status_text += f"📐 Screenshot sizes:\n"
+        status_text += f"   • Flipkart: 1240×540 (cropped)\n"
+        status_text += f"   • Amazon: 1240×649 (header removed)\n"
+        status_text += f"   • Default: 1240×649\n"
         status_text += "📸 You can send URLs for screenshots!"
     elif browser and not browser_context:
         status_text += "🌐 Screenshot engine: ⚠️ Browser loaded but context failed\n"
@@ -455,7 +510,10 @@ async def startup(app):
     print("=" * 60)
     print(f"📋 Bot Token: {BOT_TOKEN[:10]}...{BOT_TOKEN[-10:]}")
     print(f"🔌 Port: {PORT}")
-    print(f"📐 Screenshot Size: {SCREENSHOT_WIDTH}x{SCREENSHOT_HEIGHT}")
+    print(f"📐 Screenshot Sizes:")
+    print(f"   • Flipkart: 1240×540 (top 100px cropped)")
+    print(f"   • Amazon: 1240×649 (scrolled 250px)")
+    print(f"   • Default: 1240×649")
     print(f"⏱️ Timeout: {SCREENSHOT_TIMEOUT}s")
     print(f"🔄 Max Retries: {SCREENSHOT_MAX_RETRIES}")
     print("=" * 60)

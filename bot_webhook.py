@@ -68,7 +68,7 @@ async def init_browser():
             logger.info("Browser launched successfully")
             
             browser_context = await browser.new_context(
-                viewport={'width': SCREENSHOT_WIDTH, 'height': SCREENSHOT_HEIGHT},
+                viewport={'width': SCREENSHOT_WIDTH, 'height': SCREENSHOT_HEIGHT + 250},  # Extra height for Amazon
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 ignore_https_errors=True
             )
@@ -142,11 +142,13 @@ def extract_urls(text):
 
 def get_url_type(url):
     """Determine the type of URL for screenshot customization."""
-    # Flipkart short links
-    if any(domain in url.lower() for domain in ['fkrt.cc', 'fkrt.to', 'fkrt.site']):
+    url_lower = url.lower()
+    
+    # Flipkart short links - added fkrt.co
+    if any(domain in url_lower for domain in ['fkrt.cc', 'fkrt.to', 'fkrt.site', 'fkrt.co']):
         return 'flipkart'
     # Amazon links
-    elif 'amzn.to' in url.lower() or 'amazon.in' in url.lower():
+    elif 'amzn.to' in url_lower or 'amazon.in' in url_lower():
         return 'amazon'
     else:
         return 'default'
@@ -225,6 +227,15 @@ async def capture_screenshot(url, timeout=SCREENSHOT_TIMEOUT, max_retries=SCREEN
                     await page.wait_for_timeout(500)
                 except:
                     pass  # Ignore scroll errors
+            elif url_type == 'amazon':
+                # For Amazon, scroll a bit to trigger lazy loading
+                try:
+                    await page.evaluate("window.scrollTo(0, 300)")
+                    await page.wait_for_timeout(1500)
+                    await page.evaluate("window.scrollTo(0, 0)")
+                    await page.wait_for_timeout(800)
+                except:
+                    pass
             
             # Apply URL-specific screenshot logic
             if url_type == 'flipkart':
@@ -239,19 +250,14 @@ async def capture_screenshot(url, timeout=SCREENSHOT_TIMEOUT, max_retries=SCREEN
                 )
             
             elif url_type == 'amazon':
-                # For Amazon: Scroll down 250px to remove header, keep size 1240×649
-                logger.info("📸 Amazon mode: Scrolling down 250px, keeping 1240×649")
-                try:
-                    await page.evaluate("window.scrollTo(0, 250)")
-                    await page.wait_for_timeout(800)
-                except:
-                    pass
-                
+                # For Amazon: Crop top 250px but maintain 1240×649 size
+                logger.info("📸 Amazon mode: Removing top 250px header, keeping 1240×649")
                 screenshot_bytes = await page.screenshot(
                     full_page=False,
                     type='jpeg',
                     quality=85,
-                    animations='disabled'
+                    animations='disabled',
+                    clip={'x': 0, 'y': 250, 'width': SCREENSHOT_WIDTH, 'height': SCREENSHOT_HEIGHT}
                 )
             
             else:
@@ -512,7 +518,7 @@ async def startup(app):
     print(f"🔌 Port: {PORT}")
     print(f"📐 Screenshot Sizes:")
     print(f"   • Flipkart: 1240×540 (top 100px cropped)")
-    print(f"   • Amazon: 1240×649 (scrolled 250px)")
+    print(f"   • Amazon: 1240×649 (top 250px cropped)")
     print(f"   • Default: 1240×649")
     print(f"⏱️ Timeout: {SCREENSHOT_TIMEOUT}s")
     print(f"🔄 Max Retries: {SCREENSHOT_MAX_RETRIES}")

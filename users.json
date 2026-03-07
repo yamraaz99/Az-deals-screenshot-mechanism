@@ -1,0 +1,13 @@
+{
+    "admin_ids": [5329837605],
+    "contact_username": "ExploringPeople",
+    "authorized_users": {
+        "5329837605": {
+            "username": "ExploringPeople",
+            "plan": "lifetime",
+            "expiry": "2099-12-31",
+            "added_on": "2025-07-08",
+            "note": "Admin/Owner"
+        }
+    }
+}

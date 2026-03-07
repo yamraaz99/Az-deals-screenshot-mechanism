@@ -16,7 +16,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browsers (this was missing!)
+# Install Playwright browsers
 RUN python -m playwright install chromium && \
     python -m playwright install-deps chromium
 
@@ -25,6 +25,7 @@ RUN python -c "from playwright.sync_api import sync_playwright; p = sync_playwri
 
 # Copy application code
 COPY bot_webhook.py .
+COPY users.json .
 
 # Expose port
 EXPOSE 10000

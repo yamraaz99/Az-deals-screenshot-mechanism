@@ -3,7 +3,7 @@ import json
 import logging
 import asyncio
 import re
-from io import BytesIO
+import io
 from datetime import datetime, date
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 
@@ -12,54 +12,24 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telegram.constants import ChatAction
 from playwright.async_api import async_playwright
 from aiohttp import web
+from PIL import Image
 
-# ==========================================
 # Configure logging
-# ==========================================
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ==========================================
-# Get configuration from environment
-# ==========================================
+# Get configuration from environment (Auto-detects Hugging Face Space Port)
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-PORT = int(os.getenv('PORT', 10000))
+PORT = int(os.getenv('PORT', 7860))  # Changed default to 7860 for HF Spaces
 
 # Screenshot settings
 SCREENSHOT_WIDTH = 1240
 SCREENSHOT_HEIGHT = 649
-SCREENSHOT_TIMEOUT = 45
+SCREENSHOT_TIMEOUT = 60
 SCREENSHOT_MAX_RETRIES = 2
-
-# AMAZON AOD CONFIGURATION
-AOD_VIEWPORT_W = 1920
-AOD_VIEWPORT_H = 1080
-AOD_CROP_W = 576
-AOD_CROP_H = 239
-AOD_DEVICE_SCALE = 2
-
-DESKTOP_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/125.0.0.0 Safari/537.36"
-)
-AMAZON_SHORT_DOMAINS = frozenset({"amzn.in", "amzn.to", "a.co", "amzn.eu", "amzn.asia"})
-AOD_SELECTORS =[
-    "#aod-pinned-offer",
-    "#aod-offer-list",
-    "#all-offers-display",
-    "#aod-container",
-    "#aod-price-0",
-]
-AOD_DISMISS_SELECTORS = [
-    "#sp-cc-accept",
-    'input[data-action-type="DISMISS"]',
-    "#attach-close_sideSheet-link",
-    ".a-modal-close a",
-]
 
 # Global instances
 browser = None
@@ -67,9 +37,10 @@ browser_context = None
 playwright_instance = None
 application = None
 
-# ==========================================
-# ACCESS CONTROL SYSTEM
-# ==========================================
+# =====================================================
+# === ACCESS CONTROL SYSTEM ===
+# =====================================================
+
 authorized_users = {}
 admin_ids =[]
 contact_username = "admin"
@@ -77,11 +48,13 @@ contact_username = "admin"
 def load_users():
     """Load authorized users from users.json file."""
     global authorized_users, admin_ids, contact_username
+    
     possible_paths =[
         os.path.join(os.path.dirname(os.path.abspath(__file__)), 'users.json'),
         '/app/users.json',
         'users.json'
     ]
+    
     for filepath in possible_paths:
         try:
             with open(filepath, 'r') as f:
@@ -96,6 +69,7 @@ def load_users():
         except Exception as e:
             logger.error(f"Error loading users from {filepath}: {e}")
             continue
+            
     logger.error("users.json not found! No users will be authorized.")
     return False
 
@@ -106,18 +80,23 @@ def is_user_authorized(user_id: int) -> dict:
         
     user_info = authorized_users[user_id_str]
     expiry_str = user_info.get('expiry', '2000-01-01')
+    
     try:
         expiry_date = datetime.strptime(expiry_str, '%Y-%m-%d').date()
     except ValueError:
         return {'authorized': False, 'reason': 'invalid_expiry', 'info': user_info}
-    
+        
     today = date.today()
     if today > expiry_date:
-        days_expired = (today - expiry_date).days
-        return {'authorized': False, 'reason': 'expired', 'info': user_info, 'expiry_date': expiry_str, 'days_expired': days_expired}
-    
-    days_remaining = (expiry_date - today).days
-    return {'authorized': True, 'reason': 'active', 'info': user_info, 'expiry_date': expiry_str, 'days_remaining': days_remaining}
+        return {
+            'authorized': False, 'reason': 'expired', 'info': user_info,
+            'expiry_date': expiry_str, 'days_expired': (today - expiry_date).days
+        }
+        
+    return {
+        'authorized': True, 'reason': 'active', 'info': user_info,
+        'expiry_date': expiry_str, 'days_remaining': (expiry_date - today).days
+    }
 
 def is_admin(user_id: int) -> bool:
     return user_id in admin_ids
@@ -125,188 +104,82 @@ def is_admin(user_id: int) -> bool:
 def get_denial_message(auth_result: dict) -> str:
     reason = auth_result.get('reason', 'unknown')
     if reason == 'not_registered':
-        return (
-            "⚠️ *Access Denied*\n\n"
-            "You don't have access to this bot.\n\n"
-            "This is a premium bot available to paid subscribers only.\n\n"
-            f"💬 Contact @{contact_username} to get access.\n\n"
-            "💎 *Plans Available:*\n"
-            "• Monthly subscription\n• Lifetime access\n\n"
-            "Send your payment and get instant activation!"
-        )
+        return f"🚫 *Access Denied*\n\nYou don't have access to this bot.\n\nThis is a premium bot available to paid subscribers only.\n\n📞 Contact @{contact_username} to get access.\n\n💎 *Plans Available:*\n• Monthly subscription\n• Lifetime access\n\nSend your payment and get instant activation!"
     elif reason == 'expired':
-        return (
-            "⏳ *Subscription Expired*\n\n"
-            f"Hey, your subscription expired {auth_result.get('days_expired', 0)} days ago.\n\n"
-            f"💬 Contact @{contact_username} to renew your access."
-        )
-    return f"⚠️ *Access Denied*\n\n💬 Contact @{contact_username} for access."
+        expiry = auth_result.get('expiry_date', 'Unknown')
+        days = auth_result.get('days_expired', 0)
+        username = auth_result.get('info', {}).get('username', 'User')
+        return f"⚠️ *Subscription Expired*\n\nHey @{username}, your subscription expired on *{expiry}* ({days} day{'s' if days != 1 else ''} ago).\n\n📞 Contact @{contact_username} to renew your access.\n\nRenew now to continue using the bot! 🚀"
+    elif reason == 'invalid_expiry':
+        return f"⚠️ *Account Error*\n\nThere's an issue with your account configuration.\n\n📞 Please contact @{contact_username} to fix this."
+    else:
+        return f"🚫 *Access Denied*\n\n📞 Contact @{contact_username} for access."
 
 load_users()
 
-# ==========================================
-# AMAZON AOD URL UTILITIES
-# ==========================================
-def _is_amazon_short_url(url: str) -> bool:
-    host = urlparse(url).netloc.lower().removeprefix("www.")
-    return host in AMAZON_SHORT_DOMAINS
+# =====================================================
+# === BROWSER HELPERS & INIT ===
+# =====================================================
 
-def _build_aod_url(url: str) -> str:
-    p = urlparse(url)
-    host = p.netloc.lower()
-    if "amazon.in" in host and not host.startswith("www."):
-        p = p._replace(netloc="www.amazon.in")
-    qs = parse_qs(p.query, keep_blank_values=True)
-    qs["aod"] = ["1"]
-    return urlunparse(p._replace(query=urlencode(qs, doseq=True)))
-
-# ==========================================
-# AMAZON AOD ASYNC HELPERS
-# ==========================================
-async def _dismiss_amazon_popups(page) -> None:
-    for sel in AOD_DISMISS_SELECTORS:
-        try:
-            el = await page.query_selector(sel)
-            if el and await el.is_visible():
-                await el.click(timeout=1000)
-        except Exception:
-            pass
-
-async def _wait_for_aod_panel(page) -> bool:
-    combined_sel = ", ".join(AOD_SELECTORS)
-    try:
-        await page.wait_for_selector(combined_sel, state="visible", timeout=12000)
-        return True
-    except Exception:
-        return False
-
-# ==========================================
-# AMAZON AOD CAPTURE (NATIVE PLAYWRIGHT CLIP)
-# ==========================================
-async def capture_amazon_aod_screenshot(url: str, timeout: int = SCREENSHOT_TIMEOUT) -> bytes | None:
-    global browser
-    if not browser: return None
-        
-    aod_context = None
-    page = None
-    
-    try:
-        aod_context = await browser.new_context(
-            viewport={"width": AOD_VIEWPORT_W, "height": AOD_VIEWPORT_H},
-            device_scale_factor=AOD_DEVICE_SCALE,
-            user_agent=DESKTOP_UA,
-            locale="en-IN",
-            timezone_id="Asia/Kolkata",
-        )
-        
-        # Abort media/websockets to save RAM, but KEEP fonts so the 5-Star icons load
-        async def route_handler(route):
-            if route.request.resource_type in ["media", "websocket"]:
-                await route.abort()
-            else:
-                await route.continue_()
-                
-        await aod_context.route("**/*", route_handler)
-        page = await aod_context.new_page()
-        
-        working_url = url
-        if _is_amazon_short_url(url):
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=10000)
-                working_url = page.url
-            except Exception: pass
-                
-        aod_url = _build_aod_url(working_url)
-        logger.info(f"Amazon AOD: Navigating to {aod_url}")
-        
-        await page.goto(aod_url, wait_until="domcontentloaded", timeout=timeout * 1000)
-            
-        aod_found = await _wait_for_aod_panel(page)
-        if not aod_found:
-            logger.warning("Amazon AOD: Panel not found — aborting")
-            return None
-            
-        # --- THE TIMING TWEAK ---
-        # 1. Scroll down slightly to trigger any lazy-loaded scripts inside the AOD panel
-        await page.evaluate("window.scrollTo(0, 300)")
-        
-        # 2. Force wait for the price to appear! This ensures the background AJAX fetch is 100% complete
-        try:
-            await page.wait_for_selector('#aod-pinned-offer .a-price', state="visible", timeout=12000)
-        except Exception:
-            logger.warning("Amazon AOD: Price selector timeout, capturing anyway...")
-            
-        # 3. Give it 4 seconds for the CSS slide-in animation to finish and product images to pop in
-        await page.wait_for_timeout(4000)
-        
-        # 4. Scroll back to top for perfect cropping alignment
-        await page.evaluate("window.scrollTo(0, 0)")
-        await _dismiss_amazon_popups(page)
-        # ------------------------
-        
-        # NATIVE CROP: X coordinates = 1920 - 576 = 1344
-        clip_rect = {
-            "x": AOD_VIEWPORT_W - AOD_CROP_W, 
-            "y": 0,
-            "width": AOD_CROP_W,
-            "height": AOD_CROP_H
-        }
-        
-        raw_img = await page.screenshot(type="jpeg", quality=90, clip=clip_rect)
-        logger.info(f"✅ Amazon AOD natively captured!")
-        return raw_img
-        
-    except Exception as e:
-        logger.error(f"Amazon AOD Capture failed: {e}")
-        return None
-    finally:
-        if page:
-            try: await page.close()
-            except: pass
-        if aod_context:
-            try: await aod_context.close()
-            except: pass
-
-# ==========================================
-# BROWSER INIT / CLOSE
-# ==========================================
 async def init_browser():
+    """Initialize browser on startup."""
     global browser, browser_context, playwright_instance
-    try:
-        # Cleanup old broken instances if we are auto-healing
-        if browser_context:
-            try: await browser_context.close()
-            except: pass
-        if browser:
-            try: await browser.close()
-            except: pass
-
-        if not playwright_instance:
-            playwright_instance = await async_playwright().start()
-
-        browser = await playwright_instance.chromium.launch(
-            headless=True,
-            args=[
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-extensions',
-                '--disable-blink-features=AutomationControlled'
-                # REMOVED: --single-process (It causes full browser crashes)
-            ]
-        )
-
-        browser_context = await browser.new_context(
-            viewport={'width': SCREENSHOT_WIDTH, 'height': SCREENSHOT_HEIGHT},
-            user_agent=DESKTOP_UA
-        )
-
-        logger.info("✅ Browser initialized successfully!")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to initialize browser: {e}")
-        return False
+    max_retries = 3
+    retry_delay = 2
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Initializing browser (attempt {attempt + 1}/{max_retries})...")
+            if not playwright_instance:
+                playwright_instance = await async_playwright().start()
+                
+            browser = await playwright_instance.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--disable-software-rasterizer',
+                    '--disable-extensions',
+                    '--disable-blink-features=AutomationControlled',
+                    '--force-color-profile=srgb',  # Better colors
+                    '--disable-lcd-text'          # Better text AA for crops
+                ]
+            )
+            
+            # device_scale_factor=2 boosts ALL screenshots (Flipkart & Amazon Fallback) to high quality!
+            browser_context = await browser.new_context(
+                viewport={'width': SCREENSHOT_WIDTH, 'height': SCREENSHOT_HEIGHT + 250},
+                device_scale_factor=2, 
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+                ignore_https_errors=True
+            )
+            
+            # Quick Test
+            test_page = await browser_context.new_page()
+            await test_page.goto('about:blank', timeout=5000)
+            await test_page.close()
+            
+            logger.info("✅ Browser initialized successfully!")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize browser: {e}")
+            if browser_context:
+                try: await browser_context.close()
+                except: pass
+                browser_context = None
+            if browser:
+                try: await browser.close()
+                except: pass
+                browser = None
+                
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay)
+            else:
+                return False
+    return False
 
 async def close_browser():
     global browser, browser_context, playwright_instance
@@ -321,76 +194,203 @@ async def close_browser():
         except: pass
 
 def extract_urls(text):
-    if not text: return[]
-    return re.findall(r'https?://[^\s<>"{}|\^`\[\]]+', text)
+    url_pattern = r'https?://[^\s<>"{}|\^`[]]+'
+    return re.findall(url_pattern, text)
 
 def get_url_type(url):
     url_lower = url.lower()
-    if any(d in url_lower for d in['fkrt.cc', 'fkrt.to', 'fkrt.site', 'fkrt.co', 'flipkart']): return 'flipkart'
-    if any(d in url_lower for d in['amazon', 'amzn.to', 'a.co', 'amzn.eu', 'amzn.in']): return 'amazon'
+    if any(domain in url_lower for domain in['fkrt.cc', 'fkrt.to', 'fkrt.site', 'fkrt.co']):
+        return 'flipkart'
+    elif 'amzn.to' in url_lower or 'amazon.in' in url_lower:
+        return 'amazon'
     return 'default'
 
-# ==========================================
-# MAIN SCREENSHOT CAPTURE 
-# ==========================================
+# =====================================================
+# === SCREENSHOT ENGINE (AOD + FALLBACK) ===
+# =====================================================
+
 async def capture_screenshot(url, timeout=SCREENSHOT_TIMEOUT, max_retries=SCREENSHOT_MAX_RETRIES):
-    global browser, browser_context
-    if browser is None or not browser.is_connected():
-        logger.warning("⚠️ Browser process died or disconnected. Auto-restarting engine...")
-        await init_browser()
-
-    if not browser_context: 
-        logger.error("❌ Browser context is still not available.")
+    global browser_context
+    if not browser_context:
         return None
-
+        
     url_type = get_url_type(url)
+    logger.info(f"URL type detected: {url_type} for {url}")
     
-    # 1. Try AOD
-    if url_type == 'amazon':
-        aod_bytes = await capture_amazon_aod_screenshot(url, timeout)
-        if aod_bytes: return aod_bytes
-        logger.info("⚠️ AOD failed, falling back to standard Amazon capture")
-
-    # 2. Standard Capture
     for attempt in range(max_retries):
+        
+        # ----------------------------------------------------
+        # 🚀 PRIMARY LOGIC: AMAZON AOD (HIGH QUALITY CROP)
+        # ----------------------------------------------------
+        if url_type == 'amazon':
+            logger.info("Attempting primary AOD screenshot logic for Amazon...")
+            aod_page = None
+            try:
+                aod_page = await browser_context.new_page()
+                await aod_page.set_viewport_size({"width": 1920, "height": 1080})
+                
+                # 1. Resolve redirect if short domain
+                resolved_url = url
+                if any(sd in url for sd in["amzn.in", "amzn.to", "a.co", "amzn.eu", "amzn.asia"]):
+                    await aod_page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                    resolved_url = aod_page.url
+                    
+                # 2. Inject aod=1
+                p = urlparse(resolved_url)
+                qs = parse_qs(p.query, keep_blank_values=True)
+                if "aod" not in qs or qs["aod"] != ["1"]:
+                    qs["aod"] = ["1"]
+                    new_query = urlencode(qs, doseq=True)
+                    netloc = p.netloc.lower()
+                    if "amazon.in" in netloc and not netloc.startswith("www."):
+                        netloc = "www.amazon.in"
+                    aod_url = urlunparse(p._replace(query=new_query, netloc=netloc))
+                else:
+                    aod_url = resolved_url
+                    
+                # 3. Goto AOD URL
+                await aod_page.goto(aod_url, wait_until="domcontentloaded", timeout=15000)
+                
+                # 4. Dismiss Popups
+                DISMISS_SELECTORS = ["#sp-cc-accept", 'input[data-action-type="DISMISS"]', "#attach-close_sideSheet-link", ".a-modal-close a"]
+                for sel in DISMISS_SELECTORS:
+                    try:
+                        el = await aod_page.query_selector(sel)
+                        if el and await el.is_visible():
+                            await el.click(timeout=1500)
+                    except: pass
+                        
+                # 5. Wait for AOD panel & scroll into view
+                AOD_SELECTORS =["#aod-pinned-offer", "#aod-offer-list", "#all-offers-display", "#aod-container", "#aod-price-0"]
+                aod_found = False
+                for sel in AOD_SELECTORS:
+                    try:
+                        await aod_page.wait_for_selector(sel, state="visible", timeout=12000)
+                        aod_found = True
+                        break
+                    except: pass
+                        
+                if not aod_found:
+                    raise Exception("AOD panel selectors not found on page.")
+                    
+                for sel in AOD_SELECTORS:
+                    try:
+                        el = await aod_page.query_selector(sel)
+                        if el: await el.scroll_into_view_if_needed(timeout=2000)
+                    except: pass
+                
+                # 6. Capture full raw PNG for PIL cropping (Maximum compression & quality)
+                raw_png = await aod_page.screenshot(type="png", full_page=False)
+                
+                # PIL Cropping Engine
+                img = Image.open(io.BytesIO(raw_png))
+                s = img.width / 1920.0  # Dynamic scale calculation (Should be 2.0 based on context)
+                
+                CROP_W = 576
+                CROP_H = 239
+                left = max(img.width - CROP_W * s, 0)
+                upper = 0
+                right = img.width
+                lower = min(CROP_H * s, img.height)
+                
+                cropped = img.crop((left, upper, right, lower))
+                cropped = cropped.resize((CROP_W, int(CROP_H)), Image.LANCZOS)
+                
+                # Canvas pad if smaller
+                if cropped.size != (CROP_W, CROP_H):
+                    canvas = Image.new("RGB", (CROP_W, CROP_H), (255, 255, 255))
+                    canvas.paste(cropped, (CROP_W - cropped.width, 0))
+                    cropped = canvas
+                    
+                out_bytes = io.BytesIO()
+                cropped.save(out_bytes, format="PNG", optimize=True)
+                logger.info("✅ Successfully captured primary AOD screenshot.")
+                
+                await aod_page.close()
+                return out_bytes.getvalue()
+                
+            except Exception as e:
+                logger.warning(f"⚠️ Primary AOD logic failed: {str(e)}. Falling back to default Amazon mode.")
+                if aod_page:
+                    try: await aod_page.close()
+                    except: pass
+
+        # ----------------------------------------------------
+        # ⚠️ FALLBACK / REGULAR LOGIC
+        # ----------------------------------------------------
         page = None
         try:
             page = await browser_context.new_page()
+            await page.set_extra_http_headers({
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+            })
             
-            async def block_media(route):
-                if route.request.resource_type in ["font", "media"]: await route.abort()
-                else: await route.continue_()
-            await page.route("**/*", block_media)
-
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
-            except Exception: pass
+            async def route_handler(route):
+                if route.request.resource_type in ["font", "media"]:
+                    await route.abort()
+                else:
+                    await route.continue_()
+            await page.route("**/*", route_handler)
             
-            await page.wait_for_timeout(2500)
+            page_loaded = False
+            strategies = ['commit', 'domcontentloaded', 'load']
+            for strategy in strategies:
+                try:
+                    await page.goto(url, wait_until=strategy, timeout=timeout * 1000)
+                    page_loaded = True
+                    break
+                except Exception as e:
+                    if strategy == strategies[-1]: raise
+                    continue
+                    
+            if not page_loaded:
+                raise Exception("All loading strategies failed")
+                
+            await page.wait_for_timeout(2000)
+            await page.unroute("**/*")
+            await page.wait_for_timeout(1500)
             
-            if url_type == 'amazon':
-                await page.evaluate("window.scrollTo(0, 300)")
-                await page.wait_for_timeout(1000)
-                await page.evaluate("window.scrollTo(0, 0)")
-                await page.wait_for_timeout(500)
-
-            # Native Cropping instead of PIL
+            if url_type == 'default':
+                try:
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                    await page.wait_for_timeout(1000)
+                    await page.evaluate("window.scrollTo(0, 0)")
+                    await page.wait_for_timeout(500)
+                except: pass
+            elif url_type == 'amazon':
+                try:
+                    await page.evaluate("window.scrollTo(0, 300)")
+                    await page.wait_for_timeout(1500)
+                    await page.evaluate("window.scrollTo(0, 0)")
+                    await page.wait_for_timeout(800)
+                except: pass
+                
+            # Perform fallback crops
             if url_type == 'flipkart':
                 screenshot_bytes = await page.screenshot(
-                    type='jpeg', quality=85, clip={'x': 0, 'y': 100, 'width': SCREENSHOT_WIDTH, 'height': 540}
+                    full_page=False, type='jpeg', quality=85, animations='disabled',
+                    clip={'x': 0, 'y': 100, 'width': SCREENSHOT_WIDTH, 'height': 540}
                 )
             elif url_type == 'amazon':
                 screenshot_bytes = await page.screenshot(
-                    type='jpeg', quality=85, clip={'x': 0, 'y': 250, 'width': SCREENSHOT_WIDTH, 'height': SCREENSHOT_HEIGHT}
+                    full_page=False, type='jpeg', quality=85, animations='disabled',
+                    clip={'x': 0, 'y': 250, 'width': SCREENSHOT_WIDTH, 'height': SCREENSHOT_HEIGHT}
                 )
             else:
-                screenshot_bytes = await page.screenshot(type='jpeg', quality=85)
-
+                screenshot_bytes = await page.screenshot(
+                    full_page=False, type='jpeg', quality=85, animations='disabled'
+                )
+                
+            logger.info(f"Fallback/Default screenshot captured for: {url}")
             return screenshot_bytes
-
+            
         except Exception as e:
-            logger.error(f"Screenshot attempt {attempt + 1} failed: {e}")
-            await asyncio.sleep(2)
+            logger.error(f"Screenshot attempt {attempt + 1}/{max_retries} failed for {url}: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2)
+            else:
+                return None
         finally:
             if page:
                 try: await page.close()
@@ -398,111 +398,54 @@ async def capture_screenshot(url, timeout=SCREENSHOT_TIMEOUT, max_retries=SCREEN
 
     return None
 
-# ==========================================
-# COMMAND HANDLERS
-# ==========================================
+# =====================================================
+# === BOT COMMAND HANDLERS ===
+# =====================================================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    auth = is_user_authorized(update.effective_user.id)
+    user_id = update.effective_user.id
+    auth = is_user_authorized(user_id)
     if not auth['authorized']:
         await update.message.reply_text(get_denial_message(auth), parse_mode='Markdown')
         return
 
-    days_info = f"✅ {auth.get('days_remaining', 0)} days remaining" if auth.get('info', {}).get('plan') != 'lifetime' else "💎 Lifetime Access"
+    days_info = ""
+    plan = auth.get('info', {}).get('plan', 'unknown')
+    days = auth.get('days_remaining')
+    if plan == 'lifetime': days_info = "♾️ Lifetime Access"
+    elif days is not None and days <= 7: days_info = f"⚠️ {days} days remaining!"
+    else: days_info = f"⏳ {days} days remaining"
 
     await update.message.reply_text(
         f"✅ *Bot is Active!*\n📊 *Your Status:* {days_info}\n\n"
         "👋 Welcome! Send me any message containing URLs, and I'll send you screenshots!\n\n"
-        "💡 *Example messages:*\n• Check this out https://example.com\n• Multiple links in one message\n\n"
-        "✨ *Features:*\n• Extract links from any message\n• Works with forwarded messages\n"
-        "• Smart AOD panel capture for Amazon deals\n• Smart cropping for Flipkart links\n\n"
+        "📌 *Features:*\n• Extract links from any message\n• Works with forwarded messages\n"
+        "• High-quality AOD Amazon screenshots\n• Smart cropping for Flipkart\n\n"
         "Just send or forward any message with links! 🚀",
         parse_mode='Markdown'
     )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    auth = is_user_authorized(update.effective_user.id)
-    if not auth['authorized']:
-        await update.message.reply_text(get_denial_message(auth), parse_mode='Markdown')
-        return
-
-    await update.message.reply_text(
-        "📖 *How to use:*\n1. Send any message containing URLs\n2. Or forward a message with links to me\n"
-        "3. I'll extract the links automatically\n4. Wait for screenshots (may take 30-60 seconds)\n\n"
-        "🌐 *Supported:*\n• ANY website URL\n• Multiple links in one message\n\n"
-        "✂️ *Smart Cropping:*\n• Amazon links: AOD panel (576×239) — fallback 1240×649\n"
-        "• Flipkart links: 1240×540 (top cropped)\n• Other sites: 1240×649 (standard)\n\n"
-        "🤖 *Commands:*\n/start - Start the bot\n/help - Show this message\n"
-        "/status - Check if bot is working\n/myaccount - Check your subscription status",
-        parse_mode='Markdown'
-    )
-
-async def myaccount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    auth = is_user_authorized(user_id)
-    if not auth['authorized']:
-        await update.message.reply_text(get_denial_message(auth), parse_mode='Markdown')
-        return
-
-    info = auth.get('info', {})
-    plan = info.get('plan', 'Unknown')
-    expiry = auth.get('expiry_date', 'Unknown')
-    added = info.get('added_on', 'Unknown')
-    days = auth.get('days_remaining', 0)
-    username = info.get('username', 'Unknown')
-
-    await update.message.reply_text(
-        f"👤 *My Account*\n\n👤 Username: @{username}\n🔑 User ID: `{user_id}`\n"
-        f"📦 Plan: *{plan.title()}*\n📅 Active Since: {added}\n⏳ Expires: {expiry}\n"
-        f"✅ Status: {days} days remaining\n\nNeed to renew? Contact @{contact_username}",
-        parse_mode='Markdown'
-    )
-
-async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("🚫 This command is only available to admins.")
-        return
-
-    msg = "👥 *All Authorized Users:*\n\n"
-    for uid, info in authorized_users.items():
-        msg += f"• `{uid}` @{info.get('username', 'Unknown')} | {info.get('plan', '?')}\n"
-    msg += f"\n📊 Total: {len(authorized_users)} users"
-    
-    await update.message.reply_text(msg, parse_mode='Markdown')
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    auth = is_user_authorized(update.effective_user.id)
-    if not auth['authorized']:
-        await update.message.reply_text(get_denial_message(auth), parse_mode='Markdown')
-        return
-
-    status_text = "✅ Bot is active (Webhook Mode)\n\n"
-    if browser and browser_context:
-        status_text += "🟢 Screenshot engine: Ready\n"
-        status_text += f"📐 Screenshot sizes:\n  • Amazon AOD: {AOD_CROP_W}×{AOD_CROP_H} (primary)\n"
-        status_text += "  • Amazon fallback: 1240×649\n  • Flipkart: 1240×540\n  • Default: 1240×649\n"
-    else:
-        status_text += "🔴 Screenshot engine: Not initialized\n"
-    await update.message.reply_text(status_text)
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     auth = is_user_authorized(user_id)
-    
     if not auth['authorized']:
         await update.message.reply_text(get_denial_message(auth), parse_mode='Markdown')
+        return
+
+    if not browser or not browser_context:
+        await update.message.reply_text("⚠️ Screenshot service is initializing. Please try again in a moment.")
         return
 
     message_text = update.message.text or update.message.caption or ""
     urls = extract_urls(message_text)
     
     if not urls:
-        await update.message.reply_text("❌ No links found in your message!")
+        await update.message.reply_text("❌ No links found in your message!\nPlease send a message containing URLs.")
         return
 
     confirm_msg = await update.message.reply_text(
         f"🔍 Found {len(urls)} link(s)!\n📸 Generating screenshot{'s' if len(urls) > 1 else ''}...\n"
-        f"⏳ This may take 30-60 seconds for heavy websites..."
+        f"⏳ This may take 15-30 seconds for heavy websites..."
     )
 
     successful = 0
@@ -513,98 +456,111 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
             
             if len(urls) > 1:
-                try: await confirm_msg.edit_text(f"🔄 Processing link {idx}/{len(urls)}...\n🔗 {url[:50]}...")
+                try:
+                    await confirm_msg.edit_text(f"⏳ Processing link {idx}/{len(urls)}...\n🔗 {url[:50]}{'...' if len(url) > 50 else ''}")
                 except: pass
 
             screenshot_bytes = await capture_screenshot(url)
-
+            
             if not screenshot_bytes:
                 failed += 1
-                await update.message.reply_text(
-                    f"❌ Failed to capture screenshot for:\n{url}\n\n"
-                    f"⚠️ The page might be too slow, blocking bots, or timing out."
-                )
+                await update.message.reply_text(f"❌ Failed to capture screenshot for:\n{url}\n⚠️ The page might be too slow or blocked.")
                 continue
 
             caption = message_text[:1024] if len(urls) == 1 else f"📸 Screenshot {idx}/{len(urls)}\n🔗 {url[:900]}"
-            
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
-            await update.message.reply_photo(photo=BytesIO(screenshot_bytes), caption=caption)
-            
+            await update.message.reply_photo(photo=io.BytesIO(screenshot_bytes), caption=caption)
             successful += 1
-
+            
             if idx < len(urls): await asyncio.sleep(1)
-
+                
         except Exception as e:
             failed += 1
-            logger.error(f"Error processing URL: {e}")
-            await update.message.reply_text(f"❌ Error processing link {idx}/{len(urls)}:\n{url}\n\nError: {str(e)[:100]}")
+            logger.error(f"Error processing URL {idx}/{len(urls)}: {e}")
+            await update.message.reply_text(f"❌ Error processing link:\n{url}")
 
     try: await confirm_msg.delete()
     except: pass
-
+    
     summary = f"✅ Completed!\n\n📊 Results:\n✅ Successful: {successful}\n"
     if failed > 0: summary += f"❌ Failed: {failed}\n"
     await update.message.reply_text(summary)
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Update {update} caused error {context.error}")
+# =====================================================
+# === WEB & WEBHOOK HANDLERS ===
+# =====================================================
 
-# ==========================================
-# WEBHOOK & RUNNER
-# ==========================================
 async def health_check(request):
-    return web.Response(text="OK - Bot Active", status=200)
+    status = {
+        "bot": "initialized" if application else "not_initialized",
+        "browser": "ready" if (browser and browser_context) else "not_ready",
+        "authorized_users": len(authorized_users)
+    }
+    if application and browser and browser_context:
+        return web.Response(text=f"OK - Bot Active, Browser Ready. Users: {len(authorized_users)}", status=200)
+    return web.Response(text=f"Starting - {status}", status=200)
 
 async def webhook_handler(request):
-    global application
-    if not application: return web.Response(status=503)
+    if not application: return web.Response(text="Service starting, please retry", status=503)
     try:
         data = await request.json()
         update = Update.de_json(data, application.bot)
-        asyncio.create_task(application.process_update(update))
+        await application.process_update(update)
         return web.Response(status=200)
-    except Exception:
+    except Exception as e:
+        logger.error(f"Webhook error: {e}", exc_info=True)
         return web.Response(status=500)
 
 async def startup(app):
     global application
+    if not BOT_TOKEN: raise ValueError("TELEGRAM_BOT_TOKEN not set")
+    
+    logger.info("Step 1: Initializing browser...")
     await init_browser()
+    
+    logger.info("Step 2: Creating Telegram application...")
     application = Application.builder().token(BOT_TOKEN).build()
     
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("status", status))
-    application.add_handler(CommandHandler("myaccount", myaccount))
-    application.add_handler(CommandHandler("users", admin_users))
     application.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, handle_message))
-    application.add_error_handler(error_handler)
     
+    logger.info("Step 3: Initializing Telegram application...")
     await application.initialize()
     await application.start()
-
-    webhook_url = os.getenv('RENDER_EXTERNAL_URL')
+    
+    # Auto-detect webhook URL in HF Space
+    webhook_url = os.getenv('RENDER_EXTERNAL_URL', '')
+    if not webhook_url and os.getenv('SPACE_HOST'):
+        webhook_url = f"https://{os.getenv('SPACE_HOST')}"
+        
     if webhook_url:
-        full_url = f"{webhook_url}/webhook/{BOT_TOKEN}"
-        await application.bot.set_webhook(url=full_url, allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-        logger.info(f"✅ Webhook configured at {full_url}")
+        webhook_full_url = f"{webhook_url}/webhook/{BOT_TOKEN}"
+        logger.info(f"Step 4: Setting webhook to {webhook_full_url}")
+        await application.bot.set_webhook(url=webhook_full_url, allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+        print(f"✅ Webhook configured at {webhook_full_url}")
+    else:
+        logger.warning("No webhook URL set. Ensure RENDER_EXTERNAL_URL is configured.")
 
 async def shutdown(app):
-    global application
     await close_browser()
     if application:
         await application.stop()
         await application.shutdown()
 
 def create_app():
+    if not BOT_TOKEN: raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set!")
     app = web.Application()
-    app.router.add_get('/', health_check)
     app.router.add_get('/health', health_check)
-    app.router.add_post(f"/webhook/{BOT_TOKEN}", webhook_handler)
+    app.router.add_get('/', health_check)
+    app.router.add_post(f'/webhook/{BOT_TOKEN}', webhook_handler)
     app.on_startup.append(startup)
     app.on_cleanup.append(shutdown)
     return app
 
 if __name__ == '__main__':
-    app = create_app()
-    web.run_app(app, host='0.0.0.0', port=PORT)
+    try:
+        app = create_app()
+        print(f"🚀 Starting web server on 0.0.0.0:{PORT}")
+        web.run_app(app, host='0.0.0.0', port=PORT)
+    except Exception as e:
+        logger.error(f"Failed to start application: {e}")

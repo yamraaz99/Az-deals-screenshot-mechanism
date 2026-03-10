@@ -199,9 +199,9 @@ async def capture_amazon_aod_screenshot(url: str, timeout: int = SCREENSHOT_TIME
             timezone_id="Asia/Kolkata",
         )
         
-        # Abort heavy rendering requests to save Render RAM
+        # Abort media/websockets to save RAM, but KEEP fonts so the 5-Star icons load
         async def route_handler(route):
-            if route.request.resource_type in["font", "media", "websocket"]:
+            if route.request.resource_type in ["media", "websocket"]:
                 await route.abort()
             else:
                 await route.continue_()
@@ -219,7 +219,6 @@ async def capture_amazon_aod_screenshot(url: str, timeout: int = SCREENSHOT_TIME
         aod_url = _build_aod_url(working_url)
         logger.info(f"Amazon AOD: Navigating to {aod_url}")
         
-        # Removed 'networkidle', relying on domcontentloaded + manual timeout
         await page.goto(aod_url, wait_until="domcontentloaded", timeout=timeout * 1000)
             
         aod_found = await _wait_for_aod_panel(page)
@@ -227,11 +226,25 @@ async def capture_amazon_aod_screenshot(url: str, timeout: int = SCREENSHOT_TIME
             logger.warning("Amazon AOD: Panel not found — aborting")
             return None
             
-        # Give JS time to populate prices
-        await page.wait_for_timeout(3500)
-        await _dismiss_amazon_popups(page)
+        # --- THE TIMING TWEAK ---
+        # 1. Scroll down slightly to trigger any lazy-loaded scripts inside the AOD panel
+        await page.evaluate("window.scrollTo(0, 300)")
         
-        # NATIVE CROP: Replaces all the PIL logic! X coordinates = 1920 - 576 = 1344
+        # 2. Force wait for the price to appear! This ensures the background AJAX fetch is 100% complete
+        try:
+            await page.wait_for_selector('#aod-pinned-offer .a-price', state="visible", timeout=12000)
+        except Exception:
+            logger.warning("Amazon AOD: Price selector timeout, capturing anyway...")
+            
+        # 3. Give it 4 seconds for the CSS slide-in animation to finish and product images to pop in
+        await page.wait_for_timeout(4000)
+        
+        # 4. Scroll back to top for perfect cropping alignment
+        await page.evaluate("window.scrollTo(0, 0)")
+        await _dismiss_amazon_popups(page)
+        # ------------------------
+        
+        # NATIVE CROP: X coordinates = 1920 - 576 = 1344
         clip_rect = {
             "x": AOD_VIEWPORT_W - AOD_CROP_W, 
             "y": 0,

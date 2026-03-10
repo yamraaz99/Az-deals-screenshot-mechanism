@@ -248,18 +248,19 @@ async def _dismiss_amazon_popups(page) -> None:
         except Exception:
             pass
 
-
 async def _wait_for_aod_panel(page) -> bool:
-    """Wait for any AOD panel selector to become visible. Returns True if found."""
+    """Wait for any AOD panel selector to become visible."""
     for sel in AOD_SELECTORS:
         try:
             await page.wait_for_selector(sel, state="visible", timeout=AOD_SELECTOR_TIMEOUT_MS)
             logger.info(f"Amazon AOD: Panel visible → {sel}")
             return True
-        except PwTimeout:
+        except Exception as e:
+            logger.debug(f"Amazon AOD: Selector {sel} not found: {type(e).__name__}")
             continue
     logger.warning("Amazon AOD: No AOD selector found")
     return False
+
 
 
 async def _scroll_aod_into_view(page) -> None:
@@ -278,31 +279,46 @@ async def _scroll_aod_into_view(page) -> None:
 # === AMAZON AOD CAPTURE (NEW PRIMARY METHOD) ===
 # =====================================================
 
+
 async def capture_amazon_aod_screenshot(url: str, timeout: int = SCREENSHOT_TIMEOUT) -> bytes | None:
     """
-    Try to capture Amazon's AOD (All Offers Display) panel.
-    Returns cropped PNG bytes on success, None on failure.
-    Uses its own browser context with 1920×1080 viewport + 2× scale.
+    Capture Amazon AOD panel using a DEDICATED browser instance.
+    Launches its own browser with the exact same args as the working standalone script,
+    then tears it down after capture.
     """
-    global browser
+    global playwright_instance
 
-    if not browser:
-        logger.error("Amazon AOD: Browser not available")
+    if not playwright_instance:
+        logger.error("Amazon AOD: Playwright not available")
         return None
 
+    aod_browser = None
     aod_context = None
     page = None
 
     try:
-        # --- 1. Create dedicated AOD context (wider viewport + 2× DPR) ---
-        aod_context = await browser.new_context(
+        # ── 1. Launch DEDICATED browser (exact same args as working original) ──
+        logger.info("Amazon AOD: Launching dedicated browser…")
+        aod_browser = await playwright_instance.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--force-color-profile=srgb",
+                "--disable-lcd-text",
+                f"--force-device-scale-factor={AOD_DEVICE_SCALE}",
+            ],
+        )
+
+        # ── 2. Create context (matches original exactly) ──
+        aod_context = await aod_browser.new_context(
             viewport={"width": AOD_VIEWPORT_W, "height": AOD_VIEWPORT_H},
             device_scale_factor=AOD_DEVICE_SCALE,
             user_agent=DESKTOP_UA,
             locale="en-IN",
             timezone_id="Asia/Kolkata",
             java_script_enabled=True,
-            ignore_https_errors=True,
             bypass_csp=True,
         )
         await aod_context.add_init_script(
@@ -312,55 +328,55 @@ async def capture_amazon_aod_screenshot(url: str, timeout: int = SCREENSHOT_TIME
         page = await aod_context.new_page()
         page.set_default_timeout(timeout * 1000)
 
-        # --- 2. Resolve short URL if needed ---
+        # ── 3. Resolve short URL if needed ──
         working_url = url
         if _is_amazon_short_url(url):
-            logger.info("Amazon AOD: Short URL detected → resolving redirect…")
+            logger.info("Amazon AOD: Short URL → resolving…")
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
                 working_url = page.url
                 logger.info(f"Amazon AOD: Resolved → {working_url}")
             except Exception as exc:
-                logger.warning(f"Amazon AOD: Redirect resolution failed: {exc}")
+                logger.warning(f"Amazon AOD: Redirect failed: {exc}")
 
-        # --- 3. Build AOD URL and navigate ---
+        # ── 4. Build AOD URL and navigate ──
         aod_url = _build_aod_url(working_url)
         logger.info(f"Amazon AOD: Navigating → {aod_url}")
 
         resp = await page.goto(aod_url, wait_until="domcontentloaded", timeout=timeout * 1000)
         if resp and not resp.ok:
-            logger.warning(f"Amazon AOD: HTTP {resp.status} for {aod_url}")
+            logger.warning(f"Amazon AOD: HTTP {resp.status}")
 
-        # --- 4. Dismiss popups ---
+        # ── 5. Dismiss popups ──
         await _dismiss_amazon_popups(page)
 
-        # --- 5. Wait for AOD panel ---
+        # ── 6. Wait for AOD panel ──
         aod_found = await _wait_for_aod_panel(page)
         if not aod_found:
-            logger.warning("Amazon AOD: Panel not found — aborting AOD method")
+            logger.warning("Amazon AOD: Panel not found — aborting")
             return None
 
-        # --- 6. Wait for network idle (best-effort) ---
+        # ── 7. Wait for network idle (best-effort) ──
         try:
             await page.wait_for_load_state("networkidle", timeout=15_000)
-        except PwTimeout:
-            logger.warning("Amazon AOD: networkidle timed-out — continuing anyway")
+        except Exception:
+            logger.warning("Amazon AOD: networkidle timed-out — continuing")
 
         await page.wait_for_timeout(AOD_SETTLE_MS)
 
-        # --- 7. Scroll AOD into view + final dismiss ---
+        # ── 8. Scroll AOD into view + dismiss again ──
         await _scroll_aod_into_view(page)
         await page.wait_for_timeout(500)
         await _dismiss_amazon_popups(page)
 
-        # --- 8. Take viewport screenshot ---
+        # ── 9. Take viewport screenshot ──
         raw_png = await page.screenshot(type="png", full_page=False)
 
-        # --- 9. Crop & down-sample ---
+        # ── 10. Crop & downsample (2× → final size) ──
         img = Image.open(BytesIO(raw_png))
         s = AOD_DEVICE_SCALE
 
-        left = max(img.width - AOD_CROP_W * s, 0)
+        left  = max(img.width - AOD_CROP_W * s, 0)
         upper = 0
         right = img.width
         lower = min(AOD_CROP_H * s, img.height)
@@ -368,36 +384,32 @@ async def capture_amazon_aod_screenshot(url: str, timeout: int = SCREENSHOT_TIME
         cropped = img.crop((left, upper, right, lower))
         cropped = cropped.resize((AOD_CROP_W, AOD_CROP_H), Image.LANCZOS)
 
-        # Pad if needed (shouldn't happen normally)
         if cropped.size != (AOD_CROP_W, AOD_CROP_H):
             canvas = Image.new("RGB", (AOD_CROP_W, AOD_CROP_H), (255, 255, 255))
             canvas.paste(cropped, (AOD_CROP_W - cropped.width, 0))
             cropped = canvas
 
-        # Convert to bytes
         output_buf = BytesIO()
         cropped.save(output_buf, "PNG", optimize=True)
         output_buf.seek(0)
-        result_bytes = output_buf.getvalue()
 
-        logger.info(f"✅ Amazon AOD: Screenshot captured ({AOD_CROP_W}×{AOD_CROP_H})")
-        return result_bytes
+        logger.info(f"✅ Amazon AOD captured ({AOD_CROP_W}×{AOD_CROP_H})")
+        return output_buf.getvalue()
 
     except Exception as e:
         logger.error(f"Amazon AOD: Capture failed — {e}")
         return None
     finally:
         if page:
-            try:
-                await page.close()
-            except:
-                pass
+            try: await page.close()
+            except: pass
         if aod_context:
-            try:
-                await aod_context.close()
-            except:
-                pass
-
+            try: await aod_context.close()
+            except: pass
+        if aod_browser:
+            try: await aod_browser.close()
+            except: pass
+        logger.info("Amazon AOD: Dedicated browser closed")
 
 # =====================================================
 # === BROWSER INIT / CLOSE ===
@@ -994,9 +1006,8 @@ async def health_check(request):
     else:
         return web.Response(text=f"Starting - {status}", status=200)
 
-
 async def webhook_handler(request):
-    """Handle incoming webhook updates."""
+    """Handle incoming webhook updates — respond immediately, process in background."""
     global application
 
     if not application:
@@ -1006,7 +1017,8 @@ async def webhook_handler(request):
     try:
         data = await request.json()
         update = Update.de_json(data, application.bot)
-        await application.process_update(update)
+        # Process in background — don't block the HTTP response
+        asyncio.create_task(application.process_update(update))
         return web.Response(status=200)
     except Exception as e:
         logger.error(f"Webhook error: {e}", exc_info=True)

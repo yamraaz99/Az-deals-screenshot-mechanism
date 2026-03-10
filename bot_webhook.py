@@ -273,6 +273,14 @@ async def capture_amazon_aod_screenshot(url: str, timeout: int = SCREENSHOT_TIME
 async def init_browser():
     global browser, browser_context, playwright_instance
     try:
+        # Cleanup old broken instances if we are auto-healing
+        if browser_context:
+            try: await browser_context.close()
+            except: pass
+        if browser:
+            try: await browser.close()
+            except: pass
+
         if not playwright_instance:
             playwright_instance = await async_playwright().start()
 
@@ -284,9 +292,8 @@ async def init_browser():
                 '--disable-dev-shm-usage',
                 '--disable-gpu',
                 '--disable-extensions',
-                '--disable-blink-features=AutomationControlled',
-                '--no-zygote',
-                '--single-process' # Massively saves RAM
+                '--disable-blink-features=AutomationControlled'
+                # REMOVED: --single-process (It causes full browser crashes)
             ]
         )
 
@@ -327,8 +334,14 @@ def get_url_type(url):
 # MAIN SCREENSHOT CAPTURE 
 # ==========================================
 async def capture_screenshot(url, timeout=SCREENSHOT_TIMEOUT, max_retries=SCREENSHOT_MAX_RETRIES):
-    global browser_context
-    if not browser_context: return None
+    global browser, browser_context
+    if browser is None or not browser.is_connected():
+        logger.warning("⚠️ Browser process died or disconnected. Auto-restarting engine...")
+        await init_browser()
+
+    if not browser_context: 
+        logger.error("❌ Browser context is still not available.")
+        return None
 
     url_type = get_url_type(url)
     
